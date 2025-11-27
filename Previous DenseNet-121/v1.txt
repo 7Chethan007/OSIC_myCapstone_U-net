@@ -1,0 +1,635 @@
+import os
+import cv2
+import pydicom
+import pandas as pd
+import numpy as np 
+import matplotlib.pyplot as plt 
+import random
+from tqdm import tqdm 
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.models as models
+from pathlib import Path
+import albumentations as albu
+from albumentations.pytorch import ToTensorV2
+import warnings
+
+warnings.filterwarnings('ignore')
+
+def seed_everything(seed=42):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = True
+
+seed_everything(42)
+
+# Configuration
+DATA_DIR = Path("../input/osic-pulmonary-fibrosis-progression")
+TRAIN_DIR = DATA_DIR / "train"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print("🚀 OPTIMIZED OSIC Model - Targeting R² > 0.5")
+print("=" * 60)
+print(f"📱 Device: {DEVICE}")
+
+# Load Data
+train_df = pd.read_csv('../input/osic-pulmonary-fibrosis-progression/train.csv')
+print(f"Loaded dataset with shape: {train_df.shape}")
+
+def get_optimized_tab_features(df_row):
+    """Optimized tabular features - simpler but more effective"""
+    vector = []
+    
+    # Basic but effective features
+    age = df_row['Age']
+    vector.extend([
+        (age - 50) / 30,  # Centered age
+        age / 100,  # Scaled age
+    ])
+    
+    # Simple sex encoding
+    if df_row['Sex'] == 'Male':
+        vector.append(1.0)
+    else:
+        vector.append(0.0)
+    
+    # Simple smoking status
+    smoking_status = df_row['SmokingStatus']
+    if smoking_status == 'Never smoked':
+        vector.extend([1, 0, 0])
+    elif smoking_status == 'Ex-smoker':
+        vector.extend([0, 1, 0])
+    elif smoking_status == 'Currently smokes':
+        vector.extend([0, 0, 1])
+    else:
+        vector.extend([0, 0, 0])
+    
+    # FVC features
+    if 'FVC' in df_row:
+        fvc = df_row['FVC']
+        vector.extend([
+            fvc / 3000,  # Normalized FVC
+            (fvc - 2500) / 1000,  # Centered FVC
+        ])
+    
+    # Percent predicted (approximate)
+    if 'FVC' in df_row and 'Age' in df_row:
+        fvc = df_row['FVC']
+        age = df_row['Age']
+        sex = df_row['Sex']
+        
+        # Approximate percent predicted FVC
+        if sex == 'Male':
+            pp_fvc = fvc / (27.63 - 0.112 * age) if age > 0 else 0.8
+        else:
+            pp_fvc = fvc / (21.78 - 0.101 * age) if age > 0 else 0.8
+            
+        vector.append(min(pp_fvc, 2.0))  # Cap at 200%
+    
+    return np.array(vector)
+
+def calculate_lll(actual, predicted, sigma):
+    """Calculate Log Laplace Likelihood"""
+    sigma = np.maximum(sigma, 1e-6)  # Avoid division by zero
+    delta = np.abs(actual - predicted)
+    return -np.sqrt(2) * delta / sigma - np.log(sigma * np.sqrt(2))
+
+# Improved coefficient calculation
+A = {} 
+TAB = {} 
+P = []
+
+print("Calculating optimized linear decay coefficients...")
+for patient in tqdm(train_df['Patient'].unique()):
+    sub = train_df[train_df['Patient'] == patient].copy().sort_values('Weeks')
+    fvc = sub['FVC'].values
+    weeks = sub['Weeks'].values
+    
+    if len(weeks) >= 2:
+        try:
+            # Simple robust slope calculation
+            if len(weeks) == 2:
+                slope = (fvc[1] - fvc[0]) / (weeks[1] - weeks[0])
+            else:
+                # Use Theil-Sen estimator for robustness
+                slopes = []
+                for i in range(len(weeks)):
+                    for j in range(i+1, len(weeks)):
+                        if weeks[j] != weeks[i]:
+                            slope = (fvc[j] - fvc[i]) / (weeks[j] - weeks[i])
+                            slopes.append(slope)
+                slope = np.median(slopes) if slopes else 0.0
+            
+            A[patient] = slope
+        except:
+            A[patient] = 0.0
+    else:
+        A[patient] = 0.0
+    
+    TAB[patient] = get_optimized_tab_features(sub.iloc[0])
+    P.append(patient)
+
+print(f"Processed {len(P)} patients with optimized features")
+
+# Analyze target distribution
+decay_values = np.array(list(A.values()))
+print(f"Target statistics: mean={decay_values.mean():.4f}, std={decay_values.std():.4f}")
+print(f"Target range: [{decay_values.min():.4f}, {decay_values.max():.4f}]")
+
+class OptimizedAugmentation:
+    def __init__(self, augment=True):
+        if augment:
+            self.transform = albu.Compose([
+                albu.Rotate(limit=10, p=0.5),
+                albu.HorizontalFlip(p=0.4),
+                albu.ShiftScaleRotate(shift_limit=0.05, scale_limit=0.1, rotate_limit=10, p=0.6),
+                albu.RandomBrightnessContrast(brightness_limit=0.1, contrast_limit=0.1, p=0.4),
+                albu.GaussNoise(var_limit=(5.0, 20.0), p=0.3),
+                albu.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+            ])
+        else:
+            self.transform = albu.Compose([
+                albu.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+                ToTensorV2()
+            ])
+    
+    def __call__(self, image):
+        return self.transform(image=image)['image']
+
+class OptimizedDenseNetModel(nn.Module):
+    def __init__(self, tabular_dim=10, dropout_rate=0.2):
+        super(OptimizedDenseNetModel, self).__init__()
+        
+        # DenseNet121 backbone
+        densenet = models.densenet121(weights=models.DenseNet121_Weights.IMAGENET1K_V1)
+        self.features = densenet.features
+        
+        # Freeze early layers, unfreeze later layers
+        for i, param in enumerate(self.features.parameters()):
+            param.requires_grad = i > 100  # Only unfreeze later layers
+        
+        # Global pooling
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # Simple but effective tabular processor
+        self.tabular_processor = nn.Sequential(
+            nn.Linear(tabular_dim, 128),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+        )
+        
+        # Feature fusion
+        self.fusion_layer = nn.Sequential(
+            nn.Linear(1024 + 256, 512),
+            nn.BatchNorm1d(512),
+            nn.ReLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+        )
+        
+        # Output heads
+        self.mean_head = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+        
+        self.log_var_head = nn.Sequential(
+            nn.Linear(256, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Tanh()  # Constrain output
+        )
+        
+        # Initialize output layers for better convergence
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in [self.mean_head, self.log_var_head]:
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+    
+    def forward(self, images, tabular):
+        batch_size = images.size(0)
+        
+        # Extract image features
+        img_features = self.features(images)
+        img_features = self.global_pool(img_features).view(batch_size, -1)
+        
+        # Process tabular data
+        tab_features = self.tabular_processor(tabular)
+        
+        # Feature fusion
+        combined_features = torch.cat([img_features, tab_features], dim=1)
+        fused_features = self.fusion_layer(combined_features)
+        
+        # Predict mean and log variance
+        mean_pred = self.mean_head(fused_features)
+        log_var = self.log_var_head(fused_features)
+        
+        return mean_pred.squeeze(), log_var.squeeze()
+
+class OptimizedOSICDataset(Dataset):
+    def __init__(self, patients, A_dict, TAB_dict, data_dir, split='train'):
+        self.patients = [p for p in patients if p not in ['ID00011637202177653955184', 'ID00052637202186188008618']]
+        self.A_dict = A_dict
+        self.TAB_dict = TAB_dict
+        self.data_dir = Path(data_dir)
+        self.split = split
+        self.augmentor = OptimizedAugmentation(augment=(split=='train'))
+        
+        # Prepare image paths
+        self.patient_images = {}
+        for patient in self.patients:
+            patient_dir = self.data_dir / patient
+            if patient_dir.exists():
+                image_files = [f for f in patient_dir.iterdir() if f.suffix.lower() == '.dcm']
+                if image_files:
+                    self.patient_images[patient] = image_files
+        
+        self.valid_patients = [p for p in self.patients if p in self.patient_images]
+        print(f"Dataset {split}: {len(self.valid_patients)} patients with images")
+    
+    def __len__(self):
+        if self.split == 'train':
+            return len(self.valid_patients) * 8
+        else:
+            return len(self.valid_patients)
+    
+    def __getitem__(self, idx):
+        if self.split == 'train':
+            patient_idx = idx % len(self.valid_patients)
+        else:
+            patient_idx = idx
+            
+        patient = self.valid_patients[patient_idx]
+        
+        # Get random image
+        available_images = self.patient_images[patient]
+        selected_image = random.choice(available_images) if available_images else available_images[0]
+        
+        # Load and preprocess image
+        img = self.load_dicom(selected_image)
+        img_tensor = self.augmentor(img)
+        
+        # Get tabular features
+        tab_features = torch.tensor(self.TAB_dict[patient], dtype=torch.float32)
+        
+        # Get target (clipped to reasonable range)
+        target = torch.tensor(self.A_dict[patient], dtype=torch.float32)
+        
+        return img_tensor, tab_features, target, patient
+    
+    def load_dicom(self, path):
+        try:
+            dcm = pydicom.dcmread(str(path))
+            img = dcm.pixel_array.astype(np.float32)
+            
+            if len(img.shape) == 3:
+                img = img[img.shape[0]//2]
+            
+            img = cv2.resize(img, (384, 384))
+            
+            # Normalize
+            img_min, img_max = img.min(), img.max()
+            if img_max > img_min:
+                img = (img - img_min) / (img_max - img_min) * 255
+            else:
+                img = np.zeros_like(img)
+            
+            # Apply CLAHE
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            img = clahe.apply(img.astype(np.uint8))
+            
+            # Convert to 3-channel
+            img = np.stack([img, img, img], axis=2).astype(np.uint8)
+            
+            return img
+            
+        except Exception as e:
+            print(f"Error loading {path}: {e}")
+            return np.zeros((384, 384, 3), dtype=np.uint8)
+
+class OptimizedTrainer:
+    def __init__(self, model, device, lr=1e-4):
+        self.model = model
+        self.device = device
+        self.lr = lr
+        self.best_val_r2 = -float('inf')
+        self.best_val_mae = float('inf')
+        self.best_val_lll = -float('inf')
+        
+    def uncertainty_loss(self, mean_pred, log_var, targets):
+        var = torch.exp(log_var)
+        mse_loss = (mean_pred - targets) ** 2
+        return 0.5 * (mse_loss / var + log_var).mean()
+    
+    def train(self, train_loader, val_loader, epochs=50):
+        optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='max', factor=0.5, patience=5, verbose=True
+        )
+        
+        patience_counter = 0
+        
+        for epoch in range(epochs):
+            # Training
+            self.model.train()
+            train_loss = 0.0
+            train_batches = 0
+            
+            for images, tabular, targets, _ in train_loader:
+                images, tabular, targets = images.to(self.device), tabular.to(self.device), targets.to(self.device)
+                
+                optimizer.zero_grad()
+                mean_pred, log_var = self.model(images, tabular)
+                
+                # Combined loss
+                mse_loss = F.mse_loss(mean_pred, targets)
+                uncertainty_loss = self.uncertainty_loss(mean_pred, log_var, targets)
+                
+                # Start with more MSE focus, transition to uncertainty
+                if epoch < 20:
+                    loss = 0.7 * mse_loss + 0.3 * uncertainty_loss
+                else:
+                    loss = 0.3 * mse_loss + 0.7 * uncertainty_loss
+                
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                optimizer.step()
+                
+                train_loss += loss.item()
+                train_batches += 1
+            
+            # Validation - FIXED: Handle scalar predictions properly
+            self.model.eval()
+            val_predictions, val_targets, val_log_vars = [], [], []
+            
+            with torch.no_grad():
+                for images, tabular, targets, _ in val_loader:
+                    images, tabular, targets = images.to(self.device), tabular.to(self.device), targets.to(self.device)
+                    mean_pred, log_var = self.model(images, tabular)
+                    
+                    # Convert to numpy properly (handle both scalar and tensor cases)
+                    mean_pred_np = mean_pred.cpu().numpy()
+                    log_var_np = log_var.cpu().numpy()
+                    targets_np = targets.cpu().numpy()
+                    
+                    # Ensure we have arrays, not scalars
+                    if mean_pred_np.ndim == 0:  # scalar
+                        val_predictions.append(mean_pred_np.item())
+                        val_log_vars.append(log_var_np.item())
+                        val_targets.append(targets_np.item())
+                    else:  # array
+                        val_predictions.extend(mean_pred_np.tolist())
+                        val_log_vars.extend(log_var_np.tolist())
+                        val_targets.extend(targets_np.tolist())
+            
+            if len(val_predictions) > 0:
+                val_pred_np = np.array(val_predictions)
+                val_target_np = np.array(val_targets)
+                val_log_var_np = np.array(val_log_vars)
+                val_sigma_np = np.exp(val_log_var_np / 2)
+                
+                # Calculate metrics
+                r2 = r2_score(val_target_np, val_pred_np)
+                mae = np.mean(np.abs(val_pred_np - val_target_np))
+                lll_values = calculate_lll(val_target_np, val_pred_np, val_sigma_np)
+                avg_lll = np.mean(lll_values)
+                
+                avg_train_loss = train_loss / train_batches if train_batches > 0 else 0
+                current_lr = optimizer.param_groups[0]['lr']
+                
+                print(f"Epoch {epoch+1}: LR={current_lr:.2e}, Loss={avg_train_loss:.4f}")
+                print(f"          R²={r2:.4f}, MAE={mae:.4f}, LLL={avg_lll:.4f}")
+                
+                # Update scheduler
+                scheduler.step(r2)
+                
+                # Save best model
+                if r2 > self.best_val_r2:
+                    self.best_val_r2 = r2
+                    self.best_val_mae = mae
+                    self.best_val_lll = avg_lll
+                    torch.save(self.model.state_dict(), 'Oct_14_best_MAE_1_optimized_model.pth')
+                    print(f"🎯 NEW BEST! R²: {r2:.4f}")
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                
+                if patience_counter >= 10:
+                    print(f"Early stopping at epoch {epoch+1}")
+                    break
+                
+                print("-" * 50)
+        
+        return self.best_val_r2, self.best_val_mae, self.best_val_lll
+
+def optimized_main():
+    print("🔄 Creating optimized data loaders...")
+    
+    # Simple stratified split
+    patients_list = list(P)
+    decay_values = [A[patient] for patient in patients_list]
+    decay_bins = pd.cut(decay_values, bins=4, labels=False)
+    
+    train_patients, val_patients = train_test_split(
+        patients_list, test_size=0.15, random_state=42, stratify=decay_bins
+    )
+    
+    print(f"Train: {len(train_patients)}, Val: {len(val_patients)}")
+    
+    # Get tabular dimension
+    tabular_dim = len(TAB[train_patients[0]])
+    print(f"Tabular feature dimension: {tabular_dim}")
+    
+    # Clear GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Create datasets
+    train_dataset = OptimizedOSICDataset(train_patients, A, TAB, TRAIN_DIR, 'train')
+    val_dataset = OptimizedOSICDataset(val_patients, A, TAB, TRAIN_DIR, 'val')
+    
+    # Data loaders - ensure batch size > 1 to avoid scalar issues
+    train_loader = DataLoader(train_dataset, batch_size=8, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=8, shuffle=False, num_workers=2, pin_memory=True)
+    
+    # Initialize model
+    model = OptimizedDenseNetModel(tabular_dim=tabular_dim).to(DEVICE)
+    print(f"📊 Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    # Test forward pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        test_batch = next(iter(train_loader))
+        images, tabular, targets, _ = test_batch
+        images, tabular = images.to(DEVICE), tabular.to(DEVICE)
+        
+        with torch.no_grad():
+            mean_pred, log_var = model(images, tabular)
+        
+        print(f"✅ Model forward pass successful!")
+        print(f"Output shapes - Mean: {mean_pred.shape}, Log Var: {log_var.shape}")
+        print(f"💾 GPU memory: {torch.cuda.memory_allocated() / 1024**3:.2f} GB")
+        
+    except Exception as e:
+        print(f"❌ Model test failed: {e}")
+        return
+    
+    # Train model
+    trainer = OptimizedTrainer(model, DEVICE, lr=1e-4)
+    best_r2, best_mae, best_lll = trainer.train(train_loader, val_loader, epochs=50)
+    
+    print(f"\n🔥 FINAL RESULTS:")
+    print(f"Best R² = {best_r2:.4f}")
+    print(f"Best MAE = {best_mae:.4f}")
+    print(f"Best LLL = {best_lll:.4f}")
+    
+    return best_r2, best_mae, best_lll
+
+if __name__ == "__main__":
+    final_r2, final_mae, final_lll = optimized_main()
+🚀 OPTIMIZED OSIC Model - Targeting R² > 0.5
+============================================================
+📱 Device: cuda
+Loaded dataset with shape: (1549, 7)
+Calculating optimized linear decay coefficients...
+100%|██████████| 176/176 [00:00<00:00, 1082.62it/s]
+Processed 176 patients with optimized features
+Target statistics: mean=-4.8107, std=6.7150
+Target range: [-39.0741, 11.1389]
+🔄 Creating optimized data loaders...
+Train: 149, Val: 27
+Tabular feature dimension: 9
+Dataset train: 149 patients with images
+Dataset val: 25 patients with images
+📊 Model parameters: 7,827,138
+✅ Model forward pass successful!
+Output shapes - Mean: torch.Size([8]), Log Var: torch.Size([8])
+💾 GPU memory: 0.11 GB
+Epoch 1: LR=1.00e-04, Loss=44.3931
+          R²=0.0366, MAE=4.6583, LLL=-5.0808
+🎯 NEW BEST! R²: 0.0366
+--------------------------------------------------
+Epoch 2: LR=1.00e-04, Loss=30.2252
+          R²=0.1124, MAE=4.0819, LLL=-4.5801
+🎯 NEW BEST! R²: 0.1124
+--------------------------------------------------
+Epoch 3: LR=1.00e-04, Loss=29.9113
+          R²=0.0393, MAE=4.6941, LLL=-5.1883
+--------------------------------------------------
+Epoch 4: LR=1.00e-04, Loss=27.7596
+          R²=-0.2982, MAE=5.3590, LLL=-5.8118
+--------------------------------------------------
+Epoch 5: LR=1.00e-04, Loss=28.1790
+          R²=0.1421, MAE=4.3691, LLL=-4.7704
+🎯 NEW BEST! R²: 0.1421
+--------------------------------------------------
+Epoch 6: LR=1.00e-04, Loss=25.5618
+          R²=-0.0027, MAE=4.7108, LLL=-4.9841
+--------------------------------------------------
+Epoch 7: LR=1.00e-04, Loss=22.3282
+          R²=0.0993, MAE=4.4088, LLL=-4.7432
+--------------------------------------------------
+Epoch 8: LR=1.00e-04, Loss=21.6495
+          R²=-0.2529, MAE=5.2754, LLL=-5.5070
+--------------------------------------------------
+Epoch 9: LR=1.00e-04, Loss=22.4733
+          R²=0.0123, MAE=4.6334, LLL=-4.8702
+--------------------------------------------------
+Epoch 10: LR=1.00e-04, Loss=20.6737
+          R²=-0.1403, MAE=4.6680, LLL=-4.8918
+--------------------------------------------------
+Epoch 11: LR=1.00e-04, Loss=19.5252
+          R²=-0.1086, MAE=5.0529, LLL=-5.2596
+--------------------------------------------------
+Epoch 12: LR=5.00e-05, Loss=18.3312
+          R²=-0.1451, MAE=4.6703, LLL=-4.8812
+--------------------------------------------------
+Epoch 13: LR=5.00e-05, Loss=16.5409
+          R²=0.3690, MAE=3.5609, LLL=-3.9502
+🎯 NEW BEST! R²: 0.3690
+--------------------------------------------------
+Epoch 14: LR=5.00e-05, Loss=15.6858
+          R²=0.0722, MAE=4.3240, LLL=-4.6027
+--------------------------------------------------
+Epoch 15: LR=5.00e-05, Loss=17.5599
+          R²=0.0376, MAE=4.6319, LLL=-4.8522
+--------------------------------------------------
+Epoch 16: LR=5.00e-05, Loss=14.6796
+          R²=0.0995, MAE=4.3299, LLL=-4.6042
+--------------------------------------------------
+Epoch 17: LR=5.00e-05, Loss=14.2652
+          R²=-0.0824, MAE=4.6267, LLL=-4.8456
+--------------------------------------------------
+Epoch 18: LR=5.00e-05, Loss=14.3276
+          R²=0.0972, MAE=4.2458, LLL=-4.5216
+--------------------------------------------------
+Epoch 19: LR=5.00e-05, Loss=14.3892
+          R²=-0.1045, MAE=4.7642, LLL=-4.9532
+--------------------------------------------------
+Epoch 20: LR=2.50e-05, Loss=13.1137
+          R²=-0.0354, MAE=4.4052, LLL=-4.6446
+--------------------------------------------------
+Epoch 21: LR=2.50e-05, Loss=6.4237
+          R²=0.4643, MAE=3.2795, LLL=-3.6665
+🎯 NEW BEST! R²: 0.4643
+--------------------------------------------------
+Epoch 22: LR=2.50e-05, Loss=7.2648
+          R²=-0.1623, MAE=5.1628, LLL=-5.2937
+--------------------------------------------------
+Epoch 23: LR=2.50e-05, Loss=7.1096
+          R²=-0.1174, MAE=4.8299, LLL=-5.0092
+--------------------------------------------------
+Epoch 24: LR=2.50e-05, Loss=6.6777
+          R²=0.1444, MAE=4.1765, LLL=-4.4526
+--------------------------------------------------
+Epoch 25: LR=2.50e-05, Loss=7.0159
+          R²=-0.2604, MAE=5.1148, LLL=-5.2731
+--------------------------------------------------
+Epoch 26: LR=2.50e-05, Loss=6.9815
+          R²=0.1209, MAE=4.1046, LLL=-4.3782
+--------------------------------------------------
+Epoch 27: LR=2.50e-05, Loss=6.9332
+          R²=-0.0533, MAE=4.8761, LLL=-5.0431
+--------------------------------------------------
+Epoch 28: LR=1.25e-05, Loss=6.2443
+          R²=0.2558, MAE=3.9233, LLL=-4.2251
+--------------------------------------------------
+Epoch 29: LR=1.25e-05, Loss=6.0517
+          R²=0.0485, MAE=4.4509, LLL=-4.6771
+--------------------------------------------------
+Epoch 30: LR=1.25e-05, Loss=5.8502
+          R²=-0.0054, MAE=4.6701, LLL=-4.8747
+--------------------------------------------------
+Epoch 31: LR=1.25e-05, Loss=5.5734
+          R²=0.1956, MAE=4.1213, LLL=-4.4092
+Early stopping at epoch 31
+
+🔥 FINAL RESULTS:
+Best R² = 0.4643
+Best MAE = 3.2795
+Best LLL = -3.6665
